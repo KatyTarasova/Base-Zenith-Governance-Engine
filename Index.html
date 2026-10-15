@@ -1,0 +1,151 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.21;
+
+contract ZenithGovernanceEngine {
+    enum ProposalState { Active, Executed, Defeated }
+
+    struct Proposal {
+        address payable creator;
+        uint256 executionCost;
+        uint256 votesFor;
+        uint256 votesAgainst;
+        uint256 deadline;
+        ProposalState state;
+        bytes32 payloadHash;
+    }
+
+    address payable public immutable daoChairman;
+    string public daoDescriptor;
+    uint256 public proposalCounter;
+    uint256 public treasuryBalance;
+
+    mapping(uint256 => Proposal) public proposals;
+    mapping(address => address) public delegatedVoters;
+    mapping(uint256 => mapping(address => bool)) public hasVoted;
+
+    event VoteCast(uint256 indexed proposalId, address indexed voter, bool support);
+    event PowerDelegated(address indexed delegator, address indexed delegatee);
+    event TreasuryDrained(address indexed chairman, uint256 amount);
+    event ProposalExecuted(uint256 indexed proposalId, uint256 cost);
+    event TreasuryFunded(address indexed funder, uint256 amount);
+    event ProposalRegistered(uint256 indexed proposalId, address indexed creator, uint256 cost);
+    event PowerRevoked(address indexed delegator);
+    event DescriptorUpdated(string newDescriptor);
+
+    modifier onlyChairman() {
+        require(msg.sender == daoChairman, "ZenithDAO: Access denied");
+        _;
+    }
+
+    constructor() {
+        daoChairman = payable(msg.sender);
+        daoDescriptor = "Zenith Base Decentralized Governance Core v1";
+    }
+
+    // 1. castProposalVote
+    function castProposalVote(uint256 proposalId, bool support) external {
+        Proposal storage p = proposals[proposalId];
+        require(proposalId > 0 && proposalId <= proposalCounter, "ZenithDAO: Invalid ID");
+        require(block.timestamp <= p.deadline, "ZenithDAO: Voting ended");
+        require(!hasVoted[proposalId][msg.sender], "ZenithDAO: Already voted");
+        require(p.state == ProposalState.Active, "ZenithDAO: Not active");
+
+        hasVoted[proposalId][msg.sender] = true;
+        if (support) {
+            p.votesFor += 1;
+        } else {
+            p.votesAgainst += 1;
+        }
+
+        emit VoteCast(proposalId, msg.sender, support);
+    }
+
+    // 2. delegateVotingPower
+    function delegateVotingPower(address delegatee) external {
+        require(delegatee != address(0) && delegatee != msg.sender, "ZenithDAO: Invalid delegatee");
+        delegatedVoters[msg.sender] = delegatee;
+        emit PowerDelegated(msg.sender, delegatee);
+    }
+
+    // 3. drainTreasuryFunds
+    function drainTreasuryFunds() external onlyChairman {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "ZenithDAO: Zero balance");
+
+        treasuryBalance = 0;
+        (bool sent, ) = daoChairman.call{value: balance}("");
+        require(sent, "ZenithDAO: Drain failed");
+
+        emit TreasuryDrained(daoChairman, balance);
+    }
+
+    // 4. executePassedProposal
+    function executePassedProposal(uint256 proposalId) external onlyChairman {
+        Proposal storage p = proposals[proposalId];
+        require(proposalId > 0 && proposalId <= proposalCounter, "ZenithDAO: Invalid ID");
+        require(p.state == ProposalState.Active, "ZenithDAO: Not active");
+        require(p.votesFor > p.votesAgainst || block.timestamp > p.deadline, "ZenithDAO: Requirements not met");
+        require(treasuryBalance >= p.executionCost, "ZenithDAO: Insufficient treasury");
+
+        p.state = ProposalState.Executed;
+        treasuryBalance -= p.executionCost;
+
+        if (p.executionCost > 0) {
+            (bool sent, ) = p.creator.call{value: p.executionCost}("");
+            require(sent, "ZenithDAO: Execution payout failed");
+        }
+
+        emit ProposalExecuted(proposalId, p.executionCost);
+    }
+
+    // 5. fundGovernanceTreasury
+    function fundGovernanceTreasury() external payable {
+        require(msg.value > 0, "ZenithDAO: Zero deposit");
+        treasuryBalance += msg.value;
+        emit TreasuryFunded(msg.sender, msg.value);
+    }
+
+    // 6. registerNewProposal
+    function registerNewProposal(uint256 executionCost, uint256 votingWindow, bytes32 payloadHash) external returns (uint256) {
+        proposalCounter++;
+        proposals[proposalCounter] = Proposal({
+            creator: payable(msg.sender),
+            executionCost: executionCost,
+            votesFor: 0,
+            votesAgainst: 0,
+            deadline: block.timestamp + votingWindow,
+            state: ProposalState.Active,
+            payloadHash: payloadHash
+        });
+
+        emit ProposalRegistered(proposalCounter, msg.sender, executionCost);
+        return proposalCounter;
+    }
+
+    // 7. revokeDelegatedPower
+    function revokeDelegatedPower() external {
+        require(delegatedVoters[msg.sender] != address(0), "ZenithDAO: No delegation to revoke");
+        delegatedVoters[msg.sender] = address(0);
+        emit PowerRevoked(msg.sender);
+    }
+
+    // 8. updateDaoDescriptor
+    function updateDaoDescriptor(string calldata newDescriptor) external onlyChairman {
+        require(bytes(newDescriptor).length > 0, "ZenithDAO: Empty string");
+        daoDescriptor = newDescriptor;
+        emit DescriptorUpdated(newDescriptor);
+    }
+
+    // Read-метод
+    function getProposalInfo(uint256 proposalId) external view returns (
+        address creator,
+        uint256 cost,
+        uint256 votesFor,
+        uint256 votesAgainst,
+        uint256 deadline,
+        ProposalState state
+    ) {
+        Proposal memory p = proposals[proposalId];
+        return (p.creator, p.executionCost, p.votesFor, p.votesAgainst, p.deadline, p.state);
+    }
+}
